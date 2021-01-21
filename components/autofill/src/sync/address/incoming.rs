@@ -5,7 +5,7 @@
 
 use super::RecordData;
 use crate::error::*;
-use crate::sync::RecordImpl;
+use crate::sync::{MergeResult, RecordImpl};
 use interrupt_support::Interruptee;
 use rusqlite::{named_params, types::ToSql, Connection};
 use sql_support::ConnExt;
@@ -335,7 +335,7 @@ macro_rules! field_check {
         } else if should_use_local {
             $merged_record.$field_name = local_field.clone();
         } else {
-            return get_forked_record($local.clone());
+            return MergeResult::Forked { forked: get_forked_record($local.clone()) };
         }
     };
 }
@@ -355,15 +355,18 @@ impl RecordImpl for AddressesImpl {
         Ok(incoming_infos)
     }
 
-    /// Performs a three-way merge between an incoming, local, and mirror record. If a merge
-    /// cannot be successfully completed, the local record data is returned with a new guid
-    /// and updated sync metadata.
+    /// Performs a three-way merge between an incoming, local, and mirror record.
+    /// If a merge cannot be successfully completed (ie, if we find the same
+    /// field has changed both locally and remotely since the last sync), the
+    /// local record data is returned with a new guid and updated sync metadata.
+    /// Note that mirror being None is an edge-case and typically means first
+    /// sync since a "reset" (eg, disconnecting and reconnecting.
     fn merge(
         &self,
         incoming: &Self::Record,
         local: &Self::Record,
         mirror: &Option<Self::Record>,
-    ) -> Self::Record {
+    ) -> MergeResult<Self::Record> {
         let mut merged_record: Self::Record = Default::default();
 
         field_check!(given_name, incoming, local, mirror, merged_record);
@@ -379,9 +382,68 @@ impl RecordImpl for AddressesImpl {
         field_check!(tel, incoming, local, mirror, merged_record);
         field_check!(email, incoming, local, mirror, merged_record);
 
-        set_sync_times(&mut merged_record, incoming, local, mirror);
+        merged_record.time_created = incoming.time_created;
+        merged_record.time_last_used = incoming.time_last_used;
+        merged_record.time_last_modified = incoming.time_last_modified;
+        merged_record.times_used = incoming.times_used;
 
-        merged_record
+        self.merge_metadata(&mut merged_record, &local, &mirror);
+
+        MergeResult::Merged { merged: merged_record }
+    }
+
+    /// Merge the metadata from 2 or 3 records. `result` is one of the 2 or
+    /// 3, so must already have valid metadata. It doesn't matter whether this
+    /// is the local or incoming records, so long as it's different from `result`.
+    /// Note that mirror being None is an edge-case and typically means first
+    /// sync since a "reset" (eg, disconnecting and reconnecting.
+
+    fn merge_metadata(
+        &self,
+        result: &mut RecordData,
+        other: &RecordData,
+        mirror: &Option<RecordData>,
+    ) {
+        fn get_latest_time(times: &mut [Timestamp]) -> Timestamp {
+            times.sort();
+            times[times.len() - 1]
+        }
+
+        match mirror {
+            Some(m) => {
+                result.time_created =
+                    get_latest_time(&mut [result.time_created, other.time_created, m.time_created]);
+                result.time_last_used = get_latest_time(&mut [
+                    result.time_last_used,
+                    other.time_last_used,
+                    m.time_last_used,
+                ]);
+                result.time_last_modified = get_latest_time(&mut [
+                    result.time_last_modified,
+                    other.time_last_modified,
+                    m.time_last_modified,
+                ]);
+
+                result.times_used = m.times_used
+                    + (other.times_used - m.times_used)
+                    + (result.times_used - m.times_used);
+            }
+            None => {
+                result.time_created =
+                    get_latest_time(&mut [result.time_created, other.time_created]);
+                result.time_last_used =
+                    get_latest_time(&mut [result.time_last_used, other.time_last_used]);
+                result.time_last_modified =
+                    get_latest_time(&mut [result.time_last_modified, other.time_last_modified]);
+                // No mirror is an edge-case that almost certainly means the
+                // client was disconnected and this is the first sync after
+                // reconnection. So we can't really do a simple sum() of the
+                // times_used values as if the disconnection was recent, it will
+                // be double the expected value.
+                // So we just take the largest.
+                result.times_used = std::cmp::max(other.times_used, result.times_used);
+            }
+        }
     }
 
     /// Returns a local record that has the same values as the given incoming record (with the exception
@@ -467,8 +529,14 @@ impl RecordImpl for AddressesImpl {
     fn apply_action(&self, conn: &Connection, action: IncomingAction) -> Result<()> {
         log::trace!("applying action: {:?}", action);
         match action {
-            IncomingAction::Update { record } => {
-                update_local_record(conn, record)?;
+            IncomingAction::Update { record, was_merged } => {
+                update_local_record(conn, record, was_merged)?;
+            }
+            IncomingAction::Fork { forked, incoming } => {
+                // `forked` currently has the same guid as `incoming`, so fix that.
+                change_local_guid(conn, &incoming.guid, &forked.guid)?;
+                // `incoming` has the correct new guid.
+                insert_local_record(conn, incoming)?;
             }
             IncomingAction::Insert { record } => {
                 insert_local_record(conn, record)?;
@@ -477,9 +545,11 @@ impl RecordImpl for AddressesImpl {
                 // expect record to have the new guid.
                 assert_ne!(old_guid, record.guid);
                 change_local_guid(conn, &old_guid, &record.guid)?;
-                update_local_record(conn, record)?;
+                // the item is identical with the item with the new guid
+                // *except* for the metadata - so we still need to update, but
+                // don't need to treat the item as dirty.
+                update_local_record(conn, record, false)?;
             }
-
             IncomingAction::ResurrectLocalTombstone { record } => {
                 conn.execute_named(
                     "DELETE FROM addresses_tombstones WHERE guid = :guid",
@@ -488,6 +558,11 @@ impl RecordImpl for AddressesImpl {
                     },
                 )?;
                 insert_local_record(conn, record)?;
+            }
+            IncomingAction::ResurrectRemoteTombstone { record } => {
+                // This is just "ensure local record dirty", which
+                // update_local_record conveniently does.
+                update_local_record(conn, record, true)?;
             }
             IncomingAction::DeleteLocalRecord { guid } => {
                 conn.execute_named(
@@ -501,48 +576,6 @@ impl RecordImpl for AddressesImpl {
             IncomingAction::DoNothing => {}
         }
         Ok(())
-    }
-}
-
-fn set_sync_times(
-    merged_record: &mut RecordData,
-    incoming: &RecordData,
-    local: &RecordData,
-    mirror: &Option<RecordData>,
-) {
-    fn get_latest_time(times: &mut [Timestamp]) -> Timestamp {
-        times.sort();
-        times[times.len() - 1]
-    }
-
-    match mirror {
-        Some(m) => {
-            merged_record.time_created =
-                get_latest_time(&mut [incoming.time_created, local.time_created, m.time_created]);
-            merged_record.time_last_used = get_latest_time(&mut [
-                incoming.time_last_used,
-                local.time_last_used,
-                m.time_last_used,
-            ]);
-            merged_record.time_last_modified = get_latest_time(&mut [
-                incoming.time_last_modified,
-                local.time_last_modified,
-                m.time_last_modified,
-            ]);
-
-            merged_record.times_used = m.times_used
-                + (local.times_used - m.times_used)
-                + (incoming.times_used - m.times_used);
-        }
-        None => {
-            merged_record.time_created =
-                get_latest_time(&mut [incoming.time_created, local.time_created]);
-            merged_record.time_last_used =
-                get_latest_time(&mut [incoming.time_last_used, local.time_last_used]);
-            merged_record.time_last_modified =
-                get_latest_time(&mut [incoming.time_last_modified, local.time_last_modified]);
-            merged_record.times_used = local.times_used + incoming.times_used;
-        }
     }
 }
 
@@ -561,12 +594,13 @@ fn get_forked_record(local_record: RecordData) -> RecordData {
 }
 
 /// Changes the guid of the local record for the given `old_guid` to the given `new_guid` used
-/// for the `HasLocalDupe` incoming state.
+/// for the `HasLocalDupe` incoming state, and mark the item as dirty.
 fn change_local_guid(conn: &Connection, old_guid: &SyncGuid, new_guid: &SyncGuid) -> Result<()> {
     assert_ne!(old_guid, new_guid);
     conn.conn().execute_named(
         "UPDATE addresses_data
         SET guid = :new_guid
+            sync_change_counter = sync_change_counter + 1
         WHERE guid = :old_guid
         AND guid NOT IN (
             SELECT guid
@@ -587,7 +621,7 @@ fn change_local_guid(conn: &Connection, old_guid: &SyncGuid, new_guid: &SyncGuid
     Ok(())
 }
 
-fn update_local_record(conn: &Connection, new_record: RecordData) -> Result<()> {
+fn update_local_record(conn: &Connection, new_record: RecordData, flag_as_changed: bool) -> Result<()> {
     conn.execute_named(
         "UPDATE addresses_data
         SET given_name         = :given_name,
@@ -602,7 +636,7 @@ fn update_local_record(conn: &Connection, new_record: RecordData) -> Result<()> 
             country             = :country,
             tel                 = :tel,
             email               = :email,
-            sync_change_counter = 0
+            sync_change_counter = sync_change_counter + :change_counter_incr
         WHERE guid              = :guid",
         rusqlite::named_params! {
             ":given_name": new_record.given_name,
@@ -618,6 +652,7 @@ fn update_local_record(conn: &Connection, new_record: RecordData) -> Result<()> 
             ":tel": new_record.tel,
             ":email": new_record.email,
             ":guid": new_record.guid,
+            ":change_counter_incr": flag_as_changed as u32,
         },
     )?;
 

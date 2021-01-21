@@ -335,7 +335,9 @@ macro_rules! field_check {
         } else if should_use_local {
             $merged_record.$field_name = local_field.clone();
         } else {
-            return MergeResult::Forked { forked: get_forked_record($local.clone()) };
+            return MergeResult::Forked {
+                forked: get_forked_record($local.clone()),
+            };
         }
     };
 }
@@ -389,7 +391,9 @@ impl RecordImpl for AddressesImpl {
 
         self.merge_metadata(&mut merged_record, &local, &mirror);
 
-        MergeResult::Merged { merged: merged_record }
+        MergeResult::Merged {
+            merged: merged_record,
+        }
     }
 
     /// Merge the metadata from 2 or 3 records. `result` is one of the 2 or
@@ -621,7 +625,11 @@ fn change_local_guid(conn: &Connection, old_guid: &SyncGuid, new_guid: &SyncGuid
     Ok(())
 }
 
-fn update_local_record(conn: &Connection, new_record: RecordData, flag_as_changed: bool) -> Result<()> {
+fn update_local_record(
+    conn: &Connection,
+    new_record: RecordData,
+    flag_as_changed: bool,
+) -> Result<()> {
     conn.execute_named(
         "UPDATE addresses_data
         SET given_name         = :given_name,
@@ -731,15 +739,86 @@ mod tests {
     use super::*;
 
     use interrupt_support::NeverInterrupts;
-    use serde_json::{json, Value};
+    use serde_json::{json, Map, Value};
 
-    fn array_to_incoming(mut array: Value) -> Vec<Payload> {
-        let jv = array.as_array_mut().expect("you must pass a json array");
-        let mut result = Vec::with_capacity(jv.len());
-        for elt in jv {
-            result.push(Payload::from_json(elt.take()).expect("must be valid"));
+    lazy_static::lazy_static! {
+        static ref TEST_JSON_RECORDS: Map<String, Value> = {
+            let val = json! {{
+                "A" : {
+                    "id": expand_test_guid('A'),
+                    "givenName": "john",
+                    "additionalName": "",
+                    "familyName": "doe",
+                    "organization": "",
+                    "streetAddress": "1300 Broadway",
+                    "addressLevel3": "",
+                    "addressLevel2": "New York, NY",
+                    "addressLevel1": "",
+                    "postalCode": "",
+                    "country": "United States",
+                    "tel": "",
+                    "email": "",
+                    "timeCreated": 0,
+                    "timeLastUsed": 0,
+                    "timeLastModified": 0,
+                    "timesUsed": 0,
+                },
+                "C" : {
+                    "id": expand_test_guid('C'),
+                    "givenName": "jane",
+                    "additionalName": "",
+                    "familyName": "doe",
+                    "organization": "",
+                    "streetAddress": "3050 South La Brea Ave",
+                    "addressLevel3": "",
+                    "addressLevel2": "Los Angeles, CA",
+                    "addressLevel1": "",
+                    "postalCode": "",
+                    "country": "United States",
+                    "tel": "",
+                    "email": "",
+                    "timeCreated": 0,
+                    "timeLastUsed": 0,
+                    "timeLastModified": 0,
+                    "timesUsed": 0,
+                }
+            }};
+            val.as_object().expect("literal is an object").clone()
+        };
+    }
+
+    fn array_to_incoming(vals: Vec<Value>) -> Vec<Payload> {
+        let mut result = Vec::with_capacity(vals.len());
+        for elt in vals {
+            result.push(Payload::from_json(elt.clone()).expect("must be valid"));
         }
         result
+    }
+
+    fn expand_test_guid(c: char) -> String {
+        c.to_string().repeat(12)
+    }
+
+    fn test_json_record(guid_prefix: char) -> Value {
+        TEST_JSON_RECORDS
+            .get(&guid_prefix.to_string())
+            .expect("should exist")
+            .clone()
+    }
+
+    fn test_record(guid_prefix: char) -> RecordData {
+        let json = test_json_record(guid_prefix);
+        serde_json::from_value(json).expect("should be a valid record")
+    }
+
+    fn test_json_tombstone(guid_prefix: char) -> Value {
+        let t = json! {
+            {
+                "id": expand_test_guid(guid_prefix),
+                "deleted": true,
+            }
+        };
+        t
     }
 
     #[test]
@@ -748,92 +827,28 @@ mod tests {
         let mut db = new_syncable_mem_db();
         let tx = db.transaction()?;
         struct TestCase {
-            incoming_records: Value,
+            incoming_records: Vec<Value>,
             expected_record_count: u32,
             expected_tombstone_count: u32,
         }
 
         let test_cases = vec![
             TestCase {
-                incoming_records: json! {[
-                    {
-                        "id": "AAAAAAAAAAAAAAAAA",
-                        "givenName": "john",
-                        "additionalName": "",
-                        "familyName": "doe",
-                        "organization": "",
-                        "streetAddress": "1300 Broadway",
-                        "addressLevel3": "",
-                        "addressLevel2": "New York, NY",
-                        "addressLevel1": "",
-                        "postalCode": "",
-                        "country": "United States",
-                        "tel": "",
-                        "email": "",
-                        "timeCreated": 0,
-                        "timeLastUsed": 0,
-                        "timeLastModified": 0,
-                        "timesUsed": 0,
-                    }
-                ]},
+                incoming_records: vec![test_json_record('A')],
                 expected_record_count: 1,
                 expected_tombstone_count: 0,
             },
             TestCase {
-                incoming_records: json! {[
-                    {
-                        "id": "AAAAAAAAAAAAAA",
-                        "deleted": true,
-                    }
-                ]},
+                incoming_records: vec![test_json_tombstone('A')],
                 expected_record_count: 0,
                 expected_tombstone_count: 1,
             },
             TestCase {
-                incoming_records: json! {[
-                    {
-                        "id": "AAAAAAAAAAAAAAAAA",
-                        "givenName": "john",
-                        "additionalName": "",
-                        "familyName": "doe",
-                        "organization": "",
-                        "streetAddress": "1300 Broadway",
-                        "addressLevel3": "",
-                        "addressLevel2": "New York, NY",
-                        "addressLevel1": "",
-                        "postalCode": "",
-                        "country": "United States",
-                        "tel": "",
-                        "email": "",
-                        "timeCreated": 0,
-                        "timeLastUsed": 0,
-                        "timeLastModified": 0,
-                        "timesUsed": 0,
-                    },
-                    {
-                        "id": "CCCCCCCCCCCCCCCCCC",
-                        "givenName": "jane",
-                        "additionalName": "",
-                        "familyName": "doe",
-                        "organization": "",
-                        "streetAddress": "3050 South La Brea Ave",
-                        "addressLevel3": "",
-                        "addressLevel2": "Los Angeles, CA",
-                        "addressLevel1": "",
-                        "postalCode": "",
-                        "country": "United States",
-                        "tel": "",
-                        "email": "",
-                        "timeCreated": 0,
-                        "timeLastUsed": 0,
-                        "timeLastModified": 0,
-                        "timesUsed": 0,
-                    },
-                    {
-                        "id": "BBBBBBBBBBBBBBBBB",
-                        "deleted": true,
-                    }
-                ]},
+                incoming_records: vec![
+                    test_json_record('A'),
+                    test_json_record('C'),
+                    test_json_tombstone('B'),
+                ],
                 expected_record_count: 2,
                 expected_tombstone_count: 1,
             },
@@ -881,127 +896,8 @@ mod tests {
         let mut db = new_syncable_mem_db();
         let tx = db.transaction()?;
 
-        tx.execute_named(
-            "INSERT OR IGNORE INTO addresses_data (
-                guid,
-                given_name,
-                additional_name,
-                family_name,
-                organization,
-                street_address,
-                address_level3,
-                address_level2,
-                address_level1,
-                postal_code,
-                country,
-                tel,
-                email,
-                time_created,
-                time_last_used,
-                time_last_modified,
-                times_used,
-                sync_change_counter
-            ) VALUES (
-                :guid,
-                :given_name,
-                :additional_name,
-                :family_name,
-                :organization,
-                :street_address,
-                :address_level3,
-                :address_level2,
-                :address_level1,
-                :postal_code,
-                :country,
-                :tel,
-                :email,
-                :time_created,
-                :time_last_used,
-                :time_last_modified,
-                :times_used,
-                :sync_change_counter
-            )",
-            rusqlite::named_params! {
-                ":guid": "CCCCCCCCCCCCCCCCCC",
-                ":given_name": "jane",
-                ":additional_name": "",
-                ":family_name": "doe",
-                ":organization": "",
-                ":street_address": "3050 South La Brea Ave",
-                ":address_level3": "",
-                ":address_level2": "Los Angeles, CA",
-                ":address_level1": "",
-                ":postal_code": "",
-                ":country": "United States",
-                ":tel": "",
-                ":email": "",
-                ":time_created": Timestamp::now(),
-                ":time_last_used": Some(Timestamp::now()),
-                ":time_last_modified": Timestamp::now(),
-                ":times_used": 0,
-                ":sync_change_counter": 1,
-            },
-        )?;
-
-        tx.execute_named(
-            "INSERT OR IGNORE INTO temp.addresses_sync_staging (
-                guid,
-                given_name,
-                additional_name,
-                family_name,
-                organization,
-                street_address,
-                address_level3,
-                address_level2,
-                address_level1,
-                postal_code,
-                country,
-                tel,
-                email,
-                time_created,
-                time_last_used,
-                time_last_modified,
-                times_used
-            ) VALUES (
-                :guid,
-                :given_name,
-                :additional_name,
-                :family_name,
-                :organization,
-                :street_address,
-                :address_level3,
-                :address_level2,
-                :address_level1,
-                :postal_code,
-                :country,
-                :tel,
-                :email,
-                :time_created,
-                :time_last_used,
-                :time_last_modified,
-                :times_used
-            )",
-            rusqlite::named_params! {
-                ":guid": "CCCCCCCCCCCCCCCCCC",
-                ":given_name": "jane",
-                ":additional_name": "",
-                ":family_name": "doe",
-                ":organization": "",
-                ":street_address": "3050 South La Brea Ave",
-                ":address_level3": "",
-                ":address_level2": "Los Angeles, CA",
-                ":address_level1": "",
-                ":postal_code": "",
-                ":country": "United States",
-                ":tel": "",
-                ":email": "",
-                ":time_created": 0,
-                ":time_last_used": 0,
-                ":time_last_modified": 0,
-                ":times_used": 0,
-
-            },
-        )?;
+        insert_local_record(&tx, test_record('C'))?;
+        save_incoming_records(&tx, vec![test_record('C')], &NeverInterrupts)?;
 
         let t = AddressesImpl {};
         t.fetch_incoming_states(&tx)?;

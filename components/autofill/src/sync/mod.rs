@@ -33,8 +33,8 @@ enum LocalRecordInfo<T> {
 // An enum for the return value from our "merge" function, which might either
 // update the record, or might fork it.
 enum MergeResult<T> {
-    Merged { merged: T},
-    Forked { forked: T }
+    Merged { merged: T },
+    Forked { forked: T },
 }
 
 // This ties the 3 possible records together and is what we expect the
@@ -88,12 +88,17 @@ fn plan_incoming<T>(
             record: mut incoming_record,
         } => {
             match local {
-                LocalRecordInfo::Unmodified { record: local_record } => {
+                LocalRecordInfo::Unmodified {
+                    record: local_record,
+                } => {
                     // We still need to merge the metadata, but we don't reupload
                     // just for metadata changes, so don't flag the local item
                     // as dirty.
                     rec_impl.merge_metadata(&mut incoming_record, &local_record, &mirror);
-                    IncomingAction::Update { record: incoming_record, was_merged: false }
+                    IncomingAction::Update {
+                        record: incoming_record,
+                        was_merged: false,
+                    }
                 }
                 LocalRecordInfo::Modified {
                     record: local_record,
@@ -103,9 +108,15 @@ fn plan_incoming<T>(
                             // The record we save locally has material differences
                             // from the incoming one, so we are going to need to
                             // reupload it.
-                            IncomingAction::Update { record: merged, was_merged: true }
+                            IncomingAction::Update {
+                                record: merged,
+                                was_merged: true,
+                            }
+                        }
+                        MergeResult::Forked { forked } => IncomingAction::Fork {
+                            forked,
+                            incoming: incoming_record,
                         },
-                        MergeResult::Forked { forked } => IncomingAction::Fork { forked, incoming: incoming_record }
                     }
                 }
                 LocalRecordInfo::Tombstone { .. } => IncomingAction::ResurrectLocalTombstone {
@@ -256,7 +267,9 @@ mod tests {
             if incoming == local {
                 MergeResult::Merged { merged: *incoming }
             } else {
-                MergeResult::Forked { forked: incoming + local }
+                MergeResult::Forked {
+                    forked: incoming + local,
+                }
             }
         }
 
@@ -266,7 +279,7 @@ mod tests {
             _other: &Self::Record,
             _mirror: &Option<Self::Record>,
         ) {
-           // do nothing.
+            // do nothing.
         }
 
         fn get_local_dupe(
@@ -307,7 +320,10 @@ mod tests {
         };
         assert_eq!(
             plan_incoming(&conn, &testimpl, state)?,
-            IncomingAction::Update { record: 0, was_merged: false }
+            IncomingAction::Update {
+                record: 0,
+                was_merged: false
+            }
         );
 
         // LocalRecordInfo::Modified - but it turns out they are identical.
@@ -318,7 +334,10 @@ mod tests {
         };
         assert_eq!(
             plan_incoming(&conn, &testimpl, state)?,
-            IncomingAction::Update { record: 0, was_merged: true }
+            IncomingAction::Update {
+                record: 0,
+                was_merged: true
+            }
         );
 
         // LocalRecordInfo::Modified and they need to be "forked"
@@ -329,7 +348,10 @@ mod tests {
         };
         assert_eq!(
             plan_incoming(&conn, &testimpl, state)?,
-            IncomingAction::Fork { forked: 3, incoming: 1 }
+            IncomingAction::Fork {
+                forked: 3,
+                incoming: 1
+            }
         );
 
         // LocalRecordInfo::Tombstone - the local tombstone needs to be
@@ -350,12 +372,10 @@ mod tests {
             local: LocalRecordInfo::Missing,
             mirror: None,
         };
-        assert!(
-            matches!(
-                plan_incoming(&conn, &testimpl, state)?,
-                IncomingAction::UpdateLocalGuid { record: 0, .. }
-            )
-        );
+        assert!(matches!(
+            plan_incoming(&conn, &testimpl, state)?,
+            IncomingAction::UpdateLocalGuid { record: 0, .. }
+        ));
 
         // LocalRecordInfo::Missing and no dupe - it's an insert.
         let state = IncomingState {
@@ -426,5 +446,4 @@ mod tests {
         );
         Ok(())
     }
-
 }
